@@ -57,6 +57,20 @@ from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+NO_SUBSTANTIVE_CONTENT_SUMMARY = "[No substantive content available for semantic summary]"
+
+
+def _is_effectively_empty_content(content: str) -> bool:
+    stripped_lines = [line.strip() for line in (content or "").splitlines() if line.strip()]
+    if not stripped_lines:
+        return True
+    content_lines = [
+        line
+        for line in stripped_lines
+        if not re.fullmatch(r"#{1,6}\s+.+", line)
+    ]
+    return not content_lines
+
 
 @dataclass
 class DiffResult:
@@ -651,7 +665,9 @@ class SemanticProcessor(DequeueHandlerBase):
             file_vectorize_items = [
                 (file_path, summary)
                 for file_path, summary in zip(file_paths, file_summaries, strict=False)
-                if file_path in paths_to_vectorize and summary is not None
+                if file_path in paths_to_vectorize
+                and summary is not None
+                and summary.get("has_substantive_content", True)
             ]
             generated_content = await self._generate_overview(
                 dir_uri, completed_summaries, [], llm_sem=llm_sem
@@ -1057,8 +1073,20 @@ class SemanticProcessor(DequeueHandlerBase):
 
         full_content = content or ""
 
-        def result(summary: str) -> Dict[str, Any]:
-            return {"name": file_name, "summary": summary, "content": full_content}
+        def result(summary: str, *, has_substantive_content: bool = True) -> Dict[str, Any]:
+            return {
+                "name": file_name,
+                "summary": summary,
+                "content": full_content,
+                "has_substantive_content": has_substantive_content,
+            }
+
+        if _is_effectively_empty_content(full_content):
+            logger.info(
+                "Skipping LLM summary for empty content: %s",
+                file_path,
+            )
+            return result("", has_substantive_content=False)
 
         # Limit content length
         max_chars = get_openviking_config().semantic.max_file_content_chars
@@ -1321,6 +1349,14 @@ class SemanticProcessor(DequeueHandlerBase):
         if not vlm.is_available():
             logger.warning("VLM not available, using default overview")
             return f"# {dir_uri.split('/')[-1]}\n\n[Directory overview is not ready]"
+
+        file_summaries = [
+            item
+            for item in file_summaries
+            if item.get("summary", "").strip() and item.get("has_substantive_content", True)
+        ]
+        if not file_summaries and not children_abstracts:
+            return f"# {dir_uri.split('/')[-1]}\n\n{NO_SUBSTANTIVE_CONTENT_SUMMARY}"
 
         from openviking.session.memory.utils.language import resolve_output_language
 
