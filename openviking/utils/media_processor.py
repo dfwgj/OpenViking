@@ -18,6 +18,7 @@ from openviking.server.local_input_guard import (
     is_remote_resource_source,
     looks_like_local_path,
 )
+from openviking.utils.feishu_naming import feishu_document_names
 from openviking_cli.exceptions import PermissionDeniedError
 from openviking_cli.utils.logger import get_logger
 
@@ -53,6 +54,18 @@ def _smart_stem(path_or_name: str | Path) -> str:
 
     # If the suffix is not a known extension, treat the whole name as the stem
     return path.name
+
+
+def _resource_name_from_original_filename(original_filename: str, source_type: str) -> str:
+    """Derive a VikingFS resource segment from an accessor display name.
+
+    Feishu/Lark document titles are semantic names, not filesystem paths.
+    ``Path(name).name`` would truncate at ``/`` (e.g. ``API Docs/Overview`` →
+    ``Overview``). Use unified Feishu naming instead.
+    """
+    if source_type == SourceType.FEISHU:
+        return feishu_document_names(original_filename).folder_segment
+    return _smart_stem(original_filename)
 
 
 if TYPE_CHECKING:
@@ -166,8 +179,14 @@ class UnifiedResourceProcessor:
             # Set resource_name from source_name or path
             source_name = kwargs.get("source_name")
             if source_name:
-                parse_kwargs["resource_name"] = _smart_stem(source_name)
-                parse_kwargs.setdefault("source_name", source_name)
+                if local_resource.source_type == SourceType.FEISHU:
+                    names = feishu_document_names(source_name)
+                    parse_kwargs["resource_name"] = names.folder_segment
+                    parse_kwargs["resource_name_is_safe"] = True
+                    parse_kwargs.setdefault("source_name", names.title)
+                else:
+                    parse_kwargs["resource_name"] = _smart_stem(source_name)
+                    parse_kwargs.setdefault("source_name", source_name)
             else:
                 # For git repositories, use repo_name from meta if available
                 repo_name = local_resource.meta.get("repo_name")
@@ -178,7 +197,14 @@ class UnifiedResourceProcessor:
                     # Prefer original_filename from meta for HTTP downloads
                     original_filename = local_resource.meta.get("original_filename")
                     if original_filename:
-                        parse_kwargs.setdefault("resource_name", _smart_stem(original_filename))
+                        parse_kwargs.setdefault(
+                            "resource_name",
+                            _resource_name_from_original_filename(
+                                original_filename, local_resource.source_type
+                            ),
+                        )
+                        if local_resource.source_type == SourceType.FEISHU:
+                            parse_kwargs["resource_name_is_safe"] = True
                         parse_kwargs.setdefault("source_name", original_filename)
                     else:
                         parse_kwargs.setdefault("resource_name", _smart_stem(local_resource.path))
@@ -199,7 +225,31 @@ class UnifiedResourceProcessor:
 
             # For files, use ParserRouter to decide which parser to use
             parser_router = self._get_parser_router()
-            return await parser_router.parse(local_resource, **parse_kwargs)
+            result = await parser_router.parse(local_resource, **parse_kwargs)
+            if local_resource.meta:
+                for key, value in local_resource.meta.items():
+                    if key.startswith("_"):
+                        continue
+                    result.meta[key] = value
+            cleanup_path = local_resource.meta.get("_cleanup_path")
+            if cleanup_path and not result.temp_dir_path:
+                result.temp_dir_path = str(cleanup_path)
+            elif (
+                local_resource.is_temporary
+                and local_resource.path.is_file()
+                and not result.temp_dir_path
+            ):
+                result.temp_dir_path = str(local_resource.path.parent)
+            if local_resource.source_type == SourceType.FEISHU:
+                result.source_path = local_resource.original_source
+            source_warnings = local_resource.meta.get("warnings")
+            if source_warnings:
+                merged = list(result.warnings or [])
+                for warning in source_warnings:
+                    if warning not in merged:
+                        merged.append(warning)
+                result.warnings = merged
+            return result
         finally:
             # Clean up temporary resources unless they need to be preserved
             local_resource.cleanup()

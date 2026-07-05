@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from openviking.parse.parsers.feishu import FeishuParser
+from openviking_cli.exceptions import PermissionDeniedError
 
 
 def _make_block(**kwargs):
@@ -460,12 +461,13 @@ class TestParseDocxIntegration:
         mock_client = MagicMock()
         error_resp = MagicMock()
         error_resp.success.return_value = False
-        error_resp.code = 403
-        error_resp.msg = "permission denied"
+        error_resp.code = 1770032
+        error_resp.msg = "forBidden"
+        error_resp.raw = SimpleNamespace(status_code=403, content=b"")
         mock_client.docx.v1.document_block.list.return_value = error_resp
         parser._client = mock_client
 
-        with pytest.raises(RuntimeError, match="permission denied"):
+        with pytest.raises(PermissionDeniedError, match="forBidden"):
             parser._parse_docx("forbidden_doc")
 
     def test_parse_docx_mixed_blocks(self):
@@ -580,9 +582,7 @@ class TestParseAsyncIntegration:
         mock_md_instance.parse_content = _mock_parse_content
 
         with patch.object(parser, "_get_markdown_parser", return_value=mock_md_instance):
-            result = asyncio.get_event_loop().run_until_complete(
-                parser.parse("https://example.feishu.cn/docx/test123")
-            )
+            result = asyncio.run(parser.parse("https://example.feishu.cn/docx/test123"))
 
         assert result.source_format == "feishu_docx"
         assert result.parser_name == "FeishuParser"
@@ -624,9 +624,7 @@ class TestParseAsyncIntegration:
         mock_md_instance.parse_content = _mock_parse_content
 
         with patch.object(parser, "_get_markdown_parser", return_value=mock_md_instance):
-            result = asyncio.get_event_loop().run_until_complete(
-                parser.parse("https://example.feishu.cn/wiki/wiki_token")
-            )
+            result = asyncio.run(parser.parse("https://example.feishu.cn/wiki/wiki_token"))
 
         assert result.source_format == "feishu_docx"
         assert result.meta["feishu_doc_type"] == "docx"
@@ -646,7 +644,7 @@ class TestParseAsyncIntegration:
 
         parser.parse = _mock_parse
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             parser.parse_content(
                 content="", source_path="https://bytedance.larkoffice.com/wiki/larkoffice123"
             )
@@ -660,9 +658,7 @@ class TestParseAsyncIntegration:
         parser = FeishuParser()
         parser._client = MagicMock()  # Won't be called
 
-        result = asyncio.get_event_loop().run_until_complete(
-            parser.parse("https://example.feishu.cn/mindnote/abc123")
-        )
+        result = asyncio.run(parser.parse("https://example.feishu.cn/mindnote/abc123"))
 
         assert result.warnings
         assert "Unsupported" in result.warnings[0]
@@ -671,9 +667,7 @@ class TestParseAsyncIntegration:
         """Main parse() entry point must reject non-Feishu hosts."""
         parser = FeishuParser()
 
-        result = asyncio.get_event_loop().run_until_complete(
-            parser.parse("https://evil.example/docx/doxcn123")
-        )
+        result = asyncio.run(parser.parse("https://evil.example/docx/doxcn123"))
 
         assert result.source_format == "feishu"
         assert result.warnings

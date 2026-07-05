@@ -3,217 +3,125 @@
 """
 Feishu/Lark Accessor.
 
-Fetches Feishu/Lark cloud documents using the lark-oapi SDK.
-This is the DataAccessor layer extracted from FeishuParser.
-
-Note: This accessor requires the `lark-oapi` package.
-Install with: pip install 'openviking[bot-feishu]'
+Fetches Feishu/Lark cloud documents using the lark-oapi SDK and writes local
+Markdown for the two-layer import pipeline.
 """
 
-import os
+from __future__ import annotations
+
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urlparse
 
-from openviking.utils.feishu_errors import build_feishu_error_details, raise_from_lark_response
+from openviking.parse.feishu.converter import FeishuConvertOptions, FeishuMarkdownConverter
+from openviking.utils.feishu_errors import build_feishu_error_details
+from openviking.utils.feishu_naming import feishu_document_names
 from openviking_cli.utils.logger import get_logger
 
 from .base import DataAccessor, LocalResource, SourceType
 
 logger = get_logger(__name__)
 
-
-def _getattr_safe(obj, key: str, default=None):
-    """Get attribute from SDK object or dict, with safe fallback."""
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
+_FEISHU_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(feishu://image/([^)]+)\)")
 
 
 @dataclass
 class FeishuDocument:
     """Result from fetching a Feishu document."""
 
-    doc_type: str  # "docx" only for now
+    doc_type: str
     token: str
     markdown_content: str
     title: str
     meta: Dict[str, Any]
+    warnings: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.warnings is None:
+            self.warnings = []
 
 
 class FeishuAccessor(DataAccessor):
-    """
-    Accessor for Feishu/Lark cloud documents.
+    """Accessor for Feishu/Lark cloud documents."""
 
-    Supports:
-    - Documents: https://*.feishu.cn/docx/{document_id}
-    - Wiki pages: https://*.feishu.cn/wiki/{token} (resolves to docx)
-
-    Requires:
-    - lark-oapi package
-    - FEISHU_APP_ID and FEISHU_APP_SECRET environment variables, or
-      configuration in ov.conf, for app-token imports. One-time user-token
-      imports can pass feishu_access_token instead.
-    """
-
-    PRIORITY = 100  # Higher than Git/HTTP, very specific
-
-    # Wiki obj_type normalization (API returns short names)
-    _WIKI_TYPE_MAP = {"doc": "docx", "sheet": "sheets", "bitable": "base"}
-
-    # Attributes that skip processing (structural containers or metadata)
-    _SKIP_ATTRS = {"page", "table_cell", "quote_container", "grid", "grid_column"}
-
-    # Attribute → special handler method (non-text blocks)
-    _SPECIAL_BLOCK_HANDLERS = {
-        "divider": "_handle_divider",
-        "image": "_handle_image",
-        "table": "_table_block_to_markdown",
-    }
-
-    # Attribute → markdown prefix template for text-bearing blocks.
-    # "{text}" is replaced with extracted text content.
-    # Headings are handled dynamically (heading1-heading9 → # through #########).
-    _TEXT_FORMAT = {
-        "bullet": "- {text}",
-        "quote": "> {text}",
-    }
-
-    # Known block_type integer → SDK attribute name mapping.
-    # Primary dispatch mechanism for reliable block detection.
-    # Source: Feishu OpenAPI documentation + lark-oapi SDK Block class.
-    _BLOCK_TYPE_TO_ATTR = {
-        1: "page",
-        2: "text",
-        3: "heading1",
-        4: "heading2",
-        5: "heading3",
-        6: "heading4",
-        7: "heading5",
-        8: "heading6",
-        9: "heading7",
-        10: "heading8",
-        11: "heading9",
-        12: "bullet",
-        13: "ordered",
-        14: "code",
-        15: "quote",
-        17: "todo",
-        19: "callout",
-        22: "divider",
-        27: "image",
-        31: "table",
-        32: "table_cell",
-        34: "quote_container",
-    }
-
-    # All known content attribute names on SDK Block objects (for fallback detection).
-    _KNOWN_CONTENT_ATTRS = frozenset(
-        {
-            "page",
-            "text",
-            "heading1",
-            "heading2",
-            "heading3",
-            "heading4",
-            "heading5",
-            "heading6",
-            "heading7",
-            "heading8",
-            "heading9",
-            "bullet",
-            "ordered",
-            "code",
-            "quote",
-            "todo",
-            "callout",
-            "divider",
-            "image",
-            "table",
-            "table_cell",
-            "quote_container",
-            "equation",
-            "task",
-            "grid",
-            "grid_column",
-        }
-    )
+    PRIORITY = 100
 
     def __init__(self):
-        """Initialize Feishu accessor."""
-        self._client = None
-        self._user_token_client = None
-        self._config = None
+        self._converter = FeishuMarkdownConverter()
 
     @property
     def priority(self) -> int:
         return self.PRIORITY
 
     def can_handle(self, source: Union[str, Path], **kwargs) -> bool:
-        """
-        Check if this accessor can handle the source.
-
-        Handles Feishu/Lark cloud document URLs.
-        """
         source_str = str(source)
-
-        # Only handle http/https URLs
         if not source_str.startswith(("http://", "https://")):
             return False
-
         return self._is_feishu_url(source_str)
 
     async def access(self, source: Union[str, Path], **kwargs) -> LocalResource:
-        """
-        Fetch a Feishu document and save to a temporary Markdown file.
-
-        Args:
-            source: Feishu document URL
-            **kwargs: Additional arguments
-
-        Returns:
-            LocalResource pointing to the temporary Markdown file
-        """
         source_str = str(source)
         feishu_access_token = kwargs.get("feishu_access_token")
 
         try:
-            # Fetch the document and convert to Markdown
             doc = await self._fetch_document(
                 source_str,
                 feishu_access_token=feishu_access_token,
             )
 
-            # Create temporary file
-            temp_file = tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".md",
-                prefix="ov_feishu_",
-                delete=False,
+            markdown_content, downloaded_images = self._resolve_image_refs(
+                doc.markdown_content,
+                feishu_access_token=feishu_access_token,
             )
-            temp_file.write(doc.markdown_content)
-            temp_file.close()
 
-            # Build metadata
+            names = feishu_document_names(doc.title)
+
             meta = {
                 "feishu_doc_type": doc.doc_type,
                 "feishu_token": doc.token,
-                "feishu_title": doc.title,
+                "feishu_title": names.title,
+                "original_filename": names.title,
+                "feishu_resource_segment": names.folder_segment,
+                "feishu_markdown_stem": names.markdown_stem,
                 **doc.meta,
             }
+            if doc.warnings:
+                meta["warnings"] = doc.warnings
+
+            if downloaded_images:
+                temp_dir = Path(tempfile.mkdtemp(prefix="ov_feishu_"))
+                markdown_path = temp_dir / "document.md"
+                markdown_path.write_text(markdown_content, encoding="utf-8")
+                for rel_path, image_bytes in downloaded_images.items():
+                    image_path = temp_dir / rel_path
+                    image_path.parent.mkdir(parents=True, exist_ok=True)
+                    image_path.write_bytes(image_bytes)
+                meta["_cleanup_path"] = str(temp_dir)
+                local_path = markdown_path
+            else:
+                temp_file = tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".md",
+                    prefix="ov_feishu_",
+                    delete=False,
+                    encoding="utf-8",
+                )
+                temp_file.write(markdown_content)
+                temp_file.close()
+                local_path = Path(temp_file.name)
 
             return LocalResource(
-                path=Path(temp_file.name),
+                path=local_path,
                 source_type=SourceType.FEISHU,
                 original_source=source_str,
                 meta=meta,
                 is_temporary=True,
             )
-
-        except Exception as e:
-            logger.error(f"[FeishuAccessor] Failed to access {source}: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error(f"[FeishuAccessor] Failed to access {source}: {exc}", exc_info=True)
             raise
 
     async def _fetch_document(
@@ -222,57 +130,21 @@ class FeishuAccessor(DataAccessor):
         *,
         feishu_access_token: Optional[str] = None,
     ) -> FeishuDocument:
-        """
-        Fetch a Feishu document and convert to Markdown.
-
-        This method extracts and adapts the logic from FeishuParser.parse().
-        """
         import asyncio
 
-        doc_type, token = self._parse_feishu_url(url)
-        title = None
-        meta = {}
-
-        if doc_type == "wiki":
-            # Resolve wiki node to actual document type
-            real_type, real_token, title = await asyncio.to_thread(
-                self._resolve_wiki_node,
-                token,
-                feishu_access_token,
-            )
-            doc_type, token = real_type, real_token
-            meta["wiki_resolved"] = True
-
-        # Only docx is supported
-        if doc_type != "docx":
-            raise ValueError(
-                f"Unsupported Feishu document type: {doc_type}. "
-                f"Only docx is supported in this version."
-            )
-
-        # Call the handler (in thread pool since lark-oapi is sync)
-        markdown, doc_title = await asyncio.to_thread(
-            self._parse_docx,
-            token,
-            feishu_access_token,
-        )
-
-        if title:
-            doc_title = title
-
-        meta["original_url"] = url
-
+        options = FeishuConvertOptions(feishu_access_token=feishu_access_token)
+        converted = await asyncio.to_thread(self._converter.convert_url, url, options)
         return FeishuDocument(
-            doc_type=doc_type,
-            token=token,
-            markdown_content=markdown,
-            title=doc_title,
-            meta=meta,
+            doc_type=converted.doc_type,
+            token=converted.token,
+            markdown_content=converted.markdown,
+            title=converted.title,
+            meta=converted.meta,
+            warnings=converted.warnings,
         )
 
     @staticmethod
     def _is_feishu_url(url: str) -> bool:
-        """Check if URL is a Feishu/Lark cloud document."""
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower().rstrip(".")
         path = parsed.path
@@ -281,434 +153,108 @@ class FeishuAccessor(DataAccessor):
             for allowed_host in ("feishu.cn", "larksuite.com", "larkoffice.com")
         )
         has_doc_path = any(
-            path == f"/{t}" or path.startswith(f"/{t}/") for t in ("docx", "wiki", "sheets", "base")
+            path == f"/{doc_type}" or path.startswith(f"/{doc_type}/")
+            for doc_type in ("docx", "wiki", "sheets", "base")
         )
         return is_feishu_domain and has_doc_path
 
     @staticmethod
-    def _parse_feishu_url(url: str) -> Tuple[str, str]:
-        """
-        Extract doc_type and token from Feishu URL.
+    def _image_filename(file_token: str) -> str:
+        safe_token = re.sub(r"[^A-Za-z0-9_.-]+", "_", file_token).strip("._")
+        return f"{safe_token or 'image'}.png"
 
-        Returns:
-            (doc_type, token) e.g. ("docx", "doxcnABC123")
-        """
-        parsed = urlparse(url)
-        path_parts = [p for p in parsed.path.split("/") if p]
-        if len(path_parts) < 2:
-            raise ValueError(f"Cannot parse Feishu URL: {url}")
-        doc_type = path_parts[0]  # docx, wiki
-        token = path_parts[1]
-        return doc_type, token
-
-    # ========== Configuration & Client ==========
-
-    def _get_config(self):
-        """Get FeishuConfig from OpenViking config."""
-        if self._config is None:
-            from openviking_cli.utils.config import get_openviking_config
-
-            self._config = get_openviking_config().feishu
-        return self._config
-
-    def _get_client(self, *, use_user_token: bool = False):
-        """Lazy-init lark-oapi client."""
-        cache_attr = "_user_token_client" if use_user_token else "_client"
-        client = getattr(self, cache_attr)
-        if client is None:
-            try:
-                import lark_oapi as lark
-            except ImportError:
-                raise ImportError(
-                    "lark-oapi is required for Feishu document parsing. "
-                    "Install it with: pip install 'openviking[bot-feishu]'"
-                )
-            config = self._get_config()
-            app_id = config.app_id or os.getenv("FEISHU_APP_ID", "")
-            app_secret = config.app_secret or os.getenv("FEISHU_APP_SECRET", "")
-            if (not app_id or not app_secret) and not use_user_token:
-                raise ValueError(
-                    "Feishu credentials not configured. Set FEISHU_APP_ID and "
-                    "FEISHU_APP_SECRET environment variables, or configure in ov.conf."
-                )
-            domain = config.domain or "https://open.feishu.cn"
-            builder = lark.Client.builder().domain(domain)
-            if app_id and app_secret:
-                builder = builder.app_id(app_id).app_secret(app_secret)
-            if use_user_token:
-                builder = builder.enable_set_token(True)
-            client = builder.build()
-            setattr(self, cache_attr, client)
-        return client
-
-    @staticmethod
-    def _user_request_option(feishu_access_token: Optional[str]):
-        if not feishu_access_token:
-            return None
-        from lark_oapi.core.model import RequestOption
-
-        return RequestOption.builder().user_access_token(feishu_access_token).build()
-
-    # ========== Wiki Resolution ==========
-
-    def _resolve_wiki_node(
+    def _download_image(
         self,
-        token: str,
-        feishu_access_token: Optional[str] = None,
-    ) -> Tuple[str, str, Optional[str]]:
-        """
-        Resolve wiki token to actual document type, token, and title.
-
-        Returns:
-            (doc_type, obj_token, title)
-        """
-        from lark_oapi.api.wiki.v2 import GetNodeSpaceRequest
-
-        client = self._get_client(use_user_token=bool(feishu_access_token))
-        request = GetNodeSpaceRequest.builder().token(token).build()
-        option = self._user_request_option(feishu_access_token)
-        if option is None:
-            response = client.wiki.v2.space.get_node(request)
-        else:
-            response = client.wiki.v2.space.get_node(request, option)
-        if not response.success():
-            raise_from_lark_response(
-                response,
-                operation=f"resolve wiki node {token}",
-                resource=token,
-                using_user_token=bool(feishu_access_token),
-            )
-        node = response.data.node
-        obj_type = node.obj_type or ""
-        obj_token = node.obj_token or ""
-        title = node.title
-
-        # Normalize type names
-        doc_type = self._WIKI_TYPE_MAP.get(obj_type, obj_type)
-
-        return doc_type, obj_token, title
-
-    # ========== Docx Parsing ==========
-
-    def _parse_docx(
-        self,
-        document_id: str,
-        feishu_access_token: Optional[str] = None,
-    ) -> Tuple[str, str]:
-        """
-        Fetch all blocks and convert to Markdown.
-
-        Returns:
-            (markdown_content, document_title)
-        """
-        blocks = self._fetch_all_blocks(
-            document_id,
-            feishu_access_token=feishu_access_token,
-        )
-        if not blocks:
-            return "", "Untitled"
-
-        # Build block lookup by block_id
-        block_map = {b.block_id: b for b in blocks}
-
-        # Find title from page block
-        doc_title = "Untitled"
-        for b in blocks:
-            if b.page is not None:
-                if b.page.elements:
-                    doc_title = self._extract_text_from_elements(b.page.elements)
-                break
-
-        # Convert blocks to markdown
-        markdown_lines = []
-        ordered_counter: Dict[str, int] = {}
-
-        for block in blocks:
-            if block.page is not None:
-                continue  # Skip page container
-
-            line = self._block_to_markdown(
-                block, block_map, ordered_counter, document_id=document_id
-            )
-            if line is not None:
-                markdown_lines.append(line)
-
-        markdown = "\n\n".join(markdown_lines)
-
-        if doc_title and doc_title != "Untitled":
-            markdown = f"# {doc_title}\n\n{markdown}"
-
-        return markdown, doc_title
-
-    def _fetch_all_blocks(
-        self,
-        document_id: str,
+        file_token: str,
         *,
         feishu_access_token: Optional[str] = None,
-    ) -> list:
-        """Fetch all blocks with pagination. Returns list of SDK block objects."""
-        from lark_oapi.api.docx.v1 import ListDocumentBlockRequest
+    ) -> Optional[bytes]:
+        import lark_oapi as lark
 
-        client = self._get_client(use_user_token=bool(feishu_access_token))
-        all_blocks = []
-        page_token = None
+        client = self._converter._get_client(use_user_token=bool(feishu_access_token))
+        raw_req = (
+            lark.BaseRequest.builder()
+            .http_method(lark.HttpMethod.GET)
+            .uri(f"/open-apis/drive/v1/medias/{file_token}/download")
+            .token_types({lark.AccessTokenType.TENANT})
+            .build()
+        )
+        option = FeishuMarkdownConverter._user_request_option(feishu_access_token)
 
-        while True:
-            builder = (
-                ListDocumentBlockRequest.builder()
-                .document_id(document_id)
-                .page_size(500)
-                .document_revision_id(-1)
+        try:
+            raw_resp = client.request(raw_req) if option is None else client.request(raw_req, option)
+        except Exception as exc:
+            logger.warning("[FeishuAccessor] Error downloading image %s: %s", file_token, exc)
+            return None
+
+        if not raw_resp.success():
+            raw = getattr(raw_resp, "raw", None)
+            http_status = getattr(raw, "status_code", None)
+            details = build_feishu_error_details(
+                response=raw_resp,
+                operation=f"download image {file_token}",
+                resource=file_token,
+                using_user_token=bool(feishu_access_token),
             )
-            if page_token:
-                builder = builder.page_token(page_token)
-
-            request = builder.build()
-            option = self._user_request_option(feishu_access_token)
-            if option is None:
-                response = client.docx.v1.document_block.list(request)
-            else:
-                response = client.docx.v1.document_block.list(request, option)
-
-            if not response.success():
-                raise_from_lark_response(
-                    response,
-                    operation=f"fetch blocks for {document_id}",
-                    resource=document_id,
-                    using_user_token=bool(feishu_access_token),
-                )
-
-            items = response.data.items or []
-            all_blocks.extend(items)
-
-            if not response.data.has_more:
-                break
-            page_token = response.data.page_token
-
-        return all_blocks
-
-    # ========== Block -> Markdown Conversion ==========
-
-    def _detect_block_attr(self, block) -> Optional[str]:
-        """Detect which content attribute is populated on a block object.
-
-        Uses block_type integer as the primary dispatch (reliable), falling
-        back to attribute inspection over a known whitelist for unknown types.
-        """
-        # Primary: lookup by block_type integer
-        block_type = getattr(block, "block_type", None)
-        if block_type is not None:
-            attr = self._BLOCK_TYPE_TO_ATTR.get(block_type)
-            if attr:
-                return attr
-
-        # Fallback: scan known content attributes for unknown block types
-        for attr in self._KNOWN_CONTENT_ATTRS:
-            if getattr(block, attr, None) is not None:
-                return attr
-        return None
-
-    def _block_to_markdown(
-        self, block, block_map: Dict, ordered_counter: Dict[str, int], document_id: str = ""
-    ) -> Optional[str]:
-        """Convert a single SDK block object to markdown string.
-
-        Uses block_type integer for primary dispatch, with attribute whitelist
-        fallback for unknown types. Formatting is data-driven via _TEXT_FORMAT
-        and _SPECIAL_BLOCK_HANDLERS tables.
-        """
-        attr = self._detect_block_attr(block)
-
-        if attr is None:
+            detail = details.get("hint") or getattr(raw_resp, "msg", "") or f"HTTP {http_status}"
+            if http_status == 403 and "Missing Feishu API scopes" not in detail:
+                detail = f"{detail} (may require scope docs:document.media:download)"
+            logger.warning(
+                "[FeishuAccessor] Failed to download image %s: code=%s, http=%s, msg=%s, hint=%s",
+                file_token,
+                details.get("feishu_code"),
+                http_status,
+                getattr(raw_resp, "msg", None),
+                detail,
+            )
             return None
 
-        # Skip structural containers (processed via their children)
-        if attr in self._SKIP_ATTRS:
+        raw = getattr(raw_resp, "raw", None)
+        content = getattr(raw, "content", None)
+        if not content:
+            logger.warning("[FeishuAccessor] Empty image response for %s", file_token)
             return None
+        return content
 
-        # Reset ordered list counter when any non-ordered block appears
-        if attr != "ordered":
-            parent_id = block.parent_id or ""
-            if parent_id in ordered_counter:
-                del ordered_counter[parent_id]
+    def _resolve_image_refs(
+        self,
+        markdown: str,
+        *,
+        feishu_access_token: Optional[str] = None,
+    ) -> Tuple[str, Dict[str, bytes]]:
+        config = self._converter._get_config()
+        if not getattr(config, "download_images", True):
+            return markdown, {}
 
-        # Special blocks (non-text: divider, image, table)
-        special_handler = self._SPECIAL_BLOCK_HANDLERS.get(attr)
-        if special_handler:
-            return getattr(self, special_handler)(block, block_map, document_id=document_id)
+        matches = list(_FEISHU_IMAGE_RE.finditer(markdown))
+        if not matches:
+            return markdown, {}
 
-        # --- Text-bearing blocks: extract elements, apply formatting ---
-        content_obj = getattr(block, attr, None)
-        if not content_obj or not hasattr(content_obj, "elements") or not content_obj.elements:
-            return None
-
-        text = self._extract_text_from_elements(content_obj.elements)
-        if not text:
-            return None
-
-        # Headings: heading1 -> #, heading2 -> ##, ...
-        if attr.startswith("heading"):
-            level = int(attr.replace("heading", "") or "1")
-            return f"{'#' * level} {text}"
-
-        # Ordered list (needs counter state)
-        if attr == "ordered":
-            parent_id = block.parent_id or ""
-            counter = ordered_counter.get(parent_id, 0) + 1
-            ordered_counter[parent_id] = counter
-            return f"{counter}. {text}"
-
-        # Code block (needs language from style)
-        if attr == "code":
-            lang = ""
-            if hasattr(content_obj, "style") and content_obj.style:
-                lang = str(getattr(content_obj.style, "language", "") or "")
-            return f"```{lang}\n{text}\n```"
-
-        # Todo (needs done state from style)
-        if attr == "todo":
-            done = False
-            if hasattr(content_obj, "style") and content_obj.style:
-                done = getattr(content_obj.style, "done", False)
-            checkbox = "[x]" if done else "[ ]"
-            return f"- {checkbox} {text}"
-
-        # Simple template formatting (bullet, quote, etc.)
-        fmt = self._TEXT_FORMAT.get(attr)
-        if fmt:
-            return fmt.format(text=text)
-
-        # Default: return plain text (covers callout, equation, task, unknown, etc.)
-        return text
-
-    @staticmethod
-    def _handle_divider(block, block_map: Dict = None, **_) -> str:
-        """Convert divider block to markdown."""
-        return "---"
-
-    @staticmethod
-    def _handle_image(block, block_map: Dict = None, **_) -> Optional[str]:
-        """Convert image block to markdown."""
-        image = block.image
-        if not image:
-            return None
-        file_token = image.token or ""
-        alt_text = getattr(image, "alt", "") or "image"
-        return f"![{alt_text}](feishu://image/{file_token})"
-
-    def _extract_block_text(self, block, attr_name: str) -> str:
-        """Extract text from a block's named attribute (e.g. block.text, block.heading2)."""
-        content_obj = getattr(block, attr_name, None)
-        if content_obj and hasattr(content_obj, "elements") and content_obj.elements:
-            return self._extract_text_from_elements(content_obj.elements)
-        return ""
-
-    def _extract_text_from_elements(self, elements) -> str:
-        """Convert Feishu TextElement SDK objects to formatted text."""
-        if not elements:
-            return ""
-        parts = []
-        for element in elements:
-            # TextRun
-            text_run = element.text_run
-            if text_run:
-                content = text_run.content or ""
-                style = text_run.text_element_style
-                content = self._apply_text_style(content, style)
-                parts.append(content)
+        token_to_rel_path: Dict[str, str] = {}
+        downloaded_images: Dict[str, bytes] = {}
+        for match in matches:
+            file_token = match.group(2)
+            if file_token in token_to_rel_path:
                 continue
-
-            # MentionUser
-            mention_user = element.mention_user
-            if mention_user:
-                user_id = _getattr_safe(mention_user, "user_id", "user")
-                parts.append(f"@{user_id}")
+            image_bytes = self._download_image(
+                file_token,
+                feishu_access_token=feishu_access_token,
+            )
+            if image_bytes is None:
                 continue
+            rel_path = f"images/{self._image_filename(file_token)}"
+            token_to_rel_path[file_token] = rel_path
+            downloaded_images[rel_path] = image_bytes
 
-            # MentionDoc
-            mention_doc = element.mention_doc
-            if mention_doc:
-                title = _getattr_safe(mention_doc, "title", "document")
-                url = _getattr_safe(mention_doc, "url", "")
-                parts.append(f"[{title}]({url})" if url else str(title))
-                continue
+        if not downloaded_images:
+            return markdown, {}
 
-            # Equation
-            equation = element.equation
-            if equation:
-                parts.append(f"${_getattr_safe(equation, 'content', '')}$")
-                continue
+        def _replace(match: re.Match[str]) -> str:
+            alt_text = match.group(1)
+            file_token = match.group(2)
+            rel_path = token_to_rel_path.get(file_token)
+            if not rel_path:
+                return match.group(0)
+            return f"![{alt_text}]({rel_path})"
 
-        return "".join(parts)
-
-    @staticmethod
-    def _apply_text_style(text: str, style) -> str:
-        """Apply markdown formatting based on TextElementStyle SDK object."""
-        if not text or not style:
-            return text
-        # inline_code (SDK uses 'inline_code', not 'code_inline')
-        if getattr(style, "inline_code", False):
-            return f"`{text}`"
-        # link
-        link = getattr(style, "link", None)
-        if link:
-            url = _getattr_safe(link, "url", "")
-            if url:
-                text = f"[{text}]({url})"
-        if getattr(style, "bold", False):
-            text = f"**{text}**"
-        if getattr(style, "italic", False):
-            text = f"*{text}*"
-        if getattr(style, "strikethrough", False):
-            text = f"~~{text}~~"
-        return text
-
-    def _table_block_to_markdown(self, block, block_map: Dict, **_) -> Optional[str]:
-        """Convert table block to markdown table."""
-        table = block.table
-        children = block.children
-        if not table or not children:
-            return None
-
-        prop = table.property
-        if not prop:
-            return None
-        row_size = prop.row_size or 0
-        col_size = prop.column_size or 0
-        if not row_size or not col_size:
-            return None
-
-        rows = []
-        for row_idx in range(row_size):
-            row = []
-            for col_idx in range(col_size):
-                cell_idx = row_idx * col_size + col_idx
-                if cell_idx < len(children):
-                    cell_block_id = children[cell_idx]
-                    cell_block = block_map.get(cell_block_id)
-                    cell_text = self._extract_cell_text(cell_block, block_map)
-                    row.append(cell_text)
-                else:
-                    row.append("")
-            rows.append(row)
-
-        from openviking.parse.base import format_table_to_markdown
-
-        return format_table_to_markdown(rows, has_header=True) if rows else None
-
-    def _extract_cell_text(self, cell_block, block_map: Dict) -> str:
-        """Extract text from a table cell block by reading its children."""
-        if not cell_block or not cell_block.children:
-            return ""
-        texts = []
-        for child_id in cell_block.children:
-            child = block_map.get(child_id)
-            if not child:
-                continue
-            # Use attribute-driven detection to find text in any block type
-            attr = self._detect_block_attr(child)
-            if attr:
-                text = self._extract_block_text(child, attr)
-                if text:
-                    texts.append(text)
-        return " ".join(texts)
+        return _FEISHU_IMAGE_RE.sub(_replace, markdown), downloaded_images
