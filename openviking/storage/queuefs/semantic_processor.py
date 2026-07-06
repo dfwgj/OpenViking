@@ -407,12 +407,27 @@ class SemanticProcessor(DequeueHandlerBase):
                                         "Syncing semantic source into target before processing: "
                                         f"{msg.uri} -> {msg.target_uri}"
                                     )
-                                    diff = await self._sync_topdown_recursive(
-                                        msg.uri,
-                                        msg.target_uri,
-                                        ctx=current_ctx,
-                                        lock=semantic_lock.lock,
-                                    )
+                                    if msg.sync_mode == "feishu_manifest":
+                                        from openviking.utils.feishu_sync_manifest import (
+                                            sync_with_feishu_manifest,
+                                        )
+
+                                        diff = await sync_with_feishu_manifest(
+                                            msg.uri,
+                                            msg.target_uri,
+                                            ctx=current_ctx,
+                                            lock=semantic_lock.lock,
+                                            source_url=msg.source_url,
+                                            doc_type=msg.feishu_doc_type,
+                                            token=msg.feishu_token,
+                                        )
+                                    else:
+                                        diff = await self._sync_topdown_recursive(
+                                            msg.uri,
+                                            msg.target_uri,
+                                            ctx=current_ctx,
+                                            lock=semantic_lock.lock,
+                                        )
                                     logger.info(
                                         "[SyncDiff] Diff computed: "
                                         f"added_files={len(diff.added_files)}, "

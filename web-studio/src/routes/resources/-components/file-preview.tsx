@@ -16,7 +16,11 @@ import type { GetContentDownloadData } from '#/gen/ov-client/types.gen'
 import type { ContentDownloadQuery } from '@ov-server/api/v1/content'
 
 import { formatSize, normalizeReadContent } from '../-lib/normalize'
-import { fetchDirectoryLevelContent, saveFileContent } from '../-lib/api'
+import {
+  fetchDirectoryLevelContent,
+  fetchFileContent,
+  saveFileContent,
+} from '../-lib/api'
 import {
   useVikingFilePreview,
   useInvalidateVikingFs,
@@ -112,6 +116,7 @@ const contentDownloadUrl: GetContentDownloadData['url'] =
   '/api/v1/content/download'
 
 type DirectoryLevelId = 'abstract' | 'overview'
+const FEISHU_SYNC_MANIFEST_FILENAME = '.feishu_sync_manifest.json'
 
 const DIRECTORY_LEVEL_META: Array<{
   id: DirectoryLevelId
@@ -187,6 +192,16 @@ function cleanSummaryContent(value: unknown): string {
   return text
 }
 
+function parseFeishuManifest(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'string' || !value.trim()) return null
+  try {
+    const parsed = JSON.parse(value)
+    return isRecord(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
 function useDirectoryPreview(file: VikingFsEntry | null) {
   const enabled = Boolean(file?.isDir)
   const abstractQuery = useQuery({
@@ -201,11 +216,26 @@ function useDirectoryPreview(file: VikingFsEntry | null) {
     queryFn: () => fetchDirectoryLevelContent(file!.uri, 'overview'),
     staleTime: 30_000,
   })
+  const feishuManifestQuery = useQuery({
+    enabled,
+    queryKey: ['viking-directory-feishu-manifest', file?.uri],
+    queryFn: async () => {
+      const manifestUri = `${file!.uri.replace(/\/$/, '')}/${FEISHU_SYNC_MANIFEST_FILENAME}`
+      const result = await fetchFileContent(manifestUri, { raw: true })
+      return result.content
+    },
+    retry: false,
+    staleTime: 30_000,
+  })
 
   return useMemo(
-    () => ({
-      isLoading: abstractQuery.isLoading || overviewQuery.isLoading,
-      levels: [
+    () => {
+      const feishuManifest = parseFeishuManifest(feishuManifestQuery.data)
+      return {
+        isLoading: abstractQuery.isLoading || overviewQuery.isLoading,
+        isFeishuSynced: Boolean(feishuManifest),
+        feishuManifest,
+        levels: [
         {
           ...DIRECTORY_LEVEL_META[0],
           content:
@@ -221,11 +251,13 @@ function useDirectoryPreview(file: VikingFsEntry | null) {
           error: overviewQuery.error,
         },
       ],
-    }),
+      }
+    },
     [
       abstractQuery.data,
       abstractQuery.error,
       abstractQuery.isLoading,
+      feishuManifestQuery.data,
       file?.abstract,
       file?.overview,
       overviewQuery.data,
@@ -1043,6 +1075,7 @@ export function FilePreview({
   const [markdownMode, setMarkdownMode] = useState<'preview' | 'source'>(
     'preview',
   )
+  const [showFeishuBinding, setShowFeishuBinding] = useState(false)
   const [activeDirectoryLevels, setActiveDirectoryLevels] = useState<
     Set<DirectoryLevelId>
   >(new Set(['abstract', 'overview']))
@@ -1062,6 +1095,7 @@ export function FilePreview({
   useEffect(() => {
     setMarkdownMode('preview')
     setEditing(false)
+    setShowFeishuBinding(false)
     setActiveDirectoryLevels(new Set(['abstract', 'overview']))
   }, [file?.uri])
 
@@ -1207,6 +1241,21 @@ export function FilePreview({
   const visibleDirectoryLevels = availableDirectoryLevels.filter((level) =>
     activeDirectoryLevels.has(level.id),
   )
+  const manifest = directoryPreview.feishuManifest
+  const manifestFiles = Array.isArray(manifest?.files) ? manifest.files : []
+  const manifestFilePaths = manifestFiles
+    .map((item) =>
+      isRecord(item) && typeof item.path === 'string' ? item.path : '',
+    )
+    .filter((path) => path.trim())
+  const manifestSourceUrl =
+    typeof manifest?.source_url === 'string' ? manifest.source_url : ''
+  const manifestDocType =
+    typeof manifest?.doc_type === 'string' ? manifest.doc_type : ''
+  const manifestGeneratedAt =
+    typeof manifest?.generated_at === 'string' ? manifest.generated_at : ''
+  const hasDirectoryChips =
+    availableDirectoryLevels.length > 0 || directoryPreview.isFeishuSynced
   const showHeader = !(hideDirectoryHeader && file.isDir)
 
   return (
@@ -1318,7 +1367,7 @@ export function FilePreview({
 
             {file.isDir ? (
               <div className="grid gap-4">
-                {availableDirectoryLevels.length > 0 ? (
+                {hasDirectoryChips ? (
                   <div className="flex flex-wrap gap-2 border-b pb-3">
                     {availableDirectoryLevels.map((level) => {
                       const active = activeDirectoryLevels.has(level.id)
@@ -1357,27 +1406,112 @@ export function FilePreview({
                         </button>
                       )
                     })}
+                    {directoryPreview.isFeishuSynced ? (
+                      <button
+                        type="button"
+                        className={`inline-flex items-baseline gap-1.5 rounded-full border px-3 py-1 text-xs transition-colors ${
+                          showFeishuBinding
+                            ? 'border-primary bg-primary text-primary-foreground'
+                            : 'border-border bg-background text-muted-foreground hover:border-foreground/30 hover:text-foreground'
+                        }`}
+                        title={t('filePreview.feishuSyncedResourceTitle')}
+                        onClick={() => setShowFeishuBinding((value) => !value)}
+                      >
+                        <span
+                          className={`font-mono text-[10px] font-semibold uppercase tracking-wide ${
+                            showFeishuBinding
+                              ? 'text-primary-foreground'
+                              : 'text-primary'
+                          }`}
+                        >
+                          FS
+                        </span>
+                        <span className="font-medium">
+                          {t('filePreview.feishuSyncedResource')}
+                        </span>
+                      </button>
+                    ) : null}
                   </div>
                 ) : null}
 
                 {directoryPreview.isLoading &&
-                availableDirectoryLevels.length === 0 ? (
+                !hasDirectoryChips ? (
                   <div className="text-sm text-muted-foreground">
                     {t('filePreview.loadingContent')}
                   </div>
-                ) : availableDirectoryLevels.length === 0 ? (
+                ) : !hasDirectoryChips ? (
                   <div className="rounded-md border border-dashed p-6 text-sm text-muted-foreground">
                     {t('filePreview.noDirectoryContext')}
                   </div>
-                ) : visibleDirectoryLevels.length === 0 ? (
+                ) : visibleDirectoryLevels.length === 0 && !showFeishuBinding ? (
                   <div className="rounded-md border border-dashed p-6 text-sm text-muted-foreground">
                     {t('filePreview.selectDirectoryContext')}
                   </div>
                 ) : (
                   <div className="grid gap-5">
+                    {showFeishuBinding && manifest ? (
+                      <section className="grid gap-2">
+                        <header className="flex items-center gap-2 text-xs">
+                          <span className="font-mono font-semibold uppercase tracking-wide text-primary">
+                            FS
+                          </span>
+                          <span className="font-medium">
+                            {t('filePreview.feishuSyncedResource')}
+                          </span>
+                          <span className="text-muted-foreground">
+                            {t('filePreview.feishuSyncedResourceTitle')}
+                          </span>
+                        </header>
+                        <div className="grid gap-2 rounded-md border bg-muted/20 p-3 text-sm">
+                          {manifestSourceUrl ? (
+                            <div className="break-all">
+                              <span className="text-muted-foreground">
+                                {t('filePreview.feishuSourceUrl')}:{' '}
+                              </span>
+                              <span>{manifestSourceUrl}</span>
+                            </div>
+                          ) : null}
+                          <div>
+                            <span className="text-muted-foreground">
+                              {t('filePreview.feishuDocType')}:{' '}
+                            </span>
+                            <span>{manifestDocType || '-'}</span>
+                          </div>
+                          <div>
+                            <span className="text-muted-foreground">
+                              {t('filePreview.feishuManagedFiles')}:{' '}
+                            </span>
+                            {manifestFilePaths.length > 0 ? (
+                              <div className="mt-1 grid gap-1">
+                                {manifestFilePaths.map((path) => (
+                                  <code
+                                    key={path}
+                                    className="block break-all rounded bg-background/70 px-2 py-1 text-xs"
+                                  >
+                                    {path}
+                                  </code>
+                                ))}
+                              </div>
+                            ) : (
+                              <span>-</span>
+                            )}
+                          </div>
+                          {manifestGeneratedAt ? (
+                            <div>
+                              <span className="text-muted-foreground">
+                                {t('filePreview.feishuManifestUpdatedAt')}:{' '}
+                              </span>
+                              <span>{manifestGeneratedAt}</span>
+                            </div>
+                          ) : null}
+                        </div>
+                      </section>
+                    ) : null}
                     {visibleDirectoryLevels.map((level, index) => (
                       <section key={level.id} className="grid gap-2">
-                        {index > 0 ? <div className="border-t" /> : null}
+                        {index > 0 || showFeishuBinding ? (
+                          <div className="border-t" />
+                        ) : null}
                         <header className="flex items-center gap-2 text-xs">
                           <span className="font-mono font-semibold uppercase tracking-wide text-primary">
                             {level.name}

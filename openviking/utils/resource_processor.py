@@ -337,6 +337,25 @@ class ResourceProcessor:
                         await viking_fs.delete_temp(parse_result.temp_dir_path, ctx=ctx)
                         temp_uri = root_uri
                         source_committed = True
+                        if is_feishu_url(parse_result.source_path or path or ""):
+                            from openviking.utils.feishu_sync_manifest import (
+                                scan_manifest_from_uri,
+                                write_manifest_to_uri,
+                            )
+
+                            manifest = await scan_manifest_from_uri(
+                                root_uri,
+                                source_url=parse_result.source_path or path or "",
+                                doc_type=str(parse_result.meta.get("feishu_doc_type") or ""),
+                                token=str(parse_result.meta.get("feishu_token") or ""),
+                                ctx=ctx,
+                            )
+                            await write_manifest_to_uri(
+                                root_uri,
+                                manifest,
+                                ctx=ctx,
+                                lock_handle=resource_lock.handle,
+                            )
                 except Exception:
                     stage_status = "error"
                     # Mirror the Phase 3 (finalize) on-error cleanup: a lock or
@@ -367,6 +386,21 @@ class ResourceProcessor:
             if should_summarize:
                 skip_vec = not build_index
                 is_code_repo = parse_result.source_format == "repository"
+                feishu_source = parse_result.source_path or path or ""
+                feishu_manifest_sync = (
+                    is_feishu_url(feishu_source)
+                    and target_preexisting
+                    and bool(to)
+                    and temp_uri_for_summarize != result["root_uri"]
+                )
+                summarize_kwargs = dict(kwargs)
+                if feishu_manifest_sync:
+                    summarize_kwargs["sync_mode"] = "feishu_manifest"
+                    summarize_kwargs["source_url"] = feishu_source
+                    summarize_kwargs["feishu_doc_type"] = str(
+                        parse_result.meta.get("feishu_doc_type") or ""
+                    )
+                    summarize_kwargs["feishu_token"] = str(parse_result.meta.get("feishu_token") or "")
                 try:
                     stage_start = time.perf_counter()
                     stage_status = "ok"
@@ -379,7 +413,7 @@ class ResourceProcessor:
                             temp_uris=[temp_uri_for_summarize],
                             is_code_repo=is_code_repo,
                             target_preexisting=target_preexisting,
-                            **kwargs,
+                            **summarize_kwargs,
                         )
                         if (
                             resource_lock.active

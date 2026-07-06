@@ -60,6 +60,10 @@ class SemanticMsg:
     changes: Optional[Dict[str, List[str]]] = (
         None  # {"added": [...], "modified": [...], "deleted": [...]}
     )
+    sync_mode: str = "mirror"  # mirror | feishu_manifest
+    source_url: str = ""
+    feishu_doc_type: str = ""
+    feishu_token: str = ""
 
     def __init__(
         self,
@@ -79,6 +83,10 @@ class SemanticMsg:
         coalesce_key: str = "",
         coalesce_version: int = 0,
         changes: Optional[Dict[str, List[str]]] = None,
+        sync_mode: str = "mirror",
+        source_url: str = "",
+        feishu_doc_type: str = "",
+        feishu_token: str = "",
     ):
         self.id = str(uuid4())
         self.uri = uri
@@ -97,6 +105,10 @@ class SemanticMsg:
         self.coalesce_key = coalesce_key
         self.coalesce_version = coalesce_version
         self.changes = changes
+        self.sync_mode = sync_mode
+        self.source_url = source_url
+        self.feishu_doc_type = feishu_doc_type
+        self.feishu_token = feishu_token
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert object to dictionary."""
@@ -140,6 +152,10 @@ class SemanticMsg:
             coalesce_key=data.get("coalesce_key", ""),
             coalesce_version=data.get("coalesce_version", 0),
             changes=data.get("changes"),
+            sync_mode=data.get("sync_mode", "mirror"),
+            source_url=data.get("source_url", ""),
+            feishu_doc_type=data.get("feishu_doc_type", ""),
+            feishu_token=data.get("feishu_token", ""),
         )
         if "id" in data and data["id"]:
             obj.id = data["id"]

@@ -110,6 +110,7 @@ const HIDDEN_SUMMARY_FILENAMES = new Set([
   '.abstract.md',
   '.overview',
   '.overview.md',
+  '.feishu_sync_manifest.json',
 ])
 
 function pickFirstNonEmpty(values: Array<unknown>): unknown {
