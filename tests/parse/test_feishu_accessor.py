@@ -69,14 +69,15 @@ class _FakeBaseRequestBuilder:
 
 
 class _FakeRawResponse:
-    def __init__(self, content=b"image-bytes", status_code=200):
+    def __init__(self, content=b"image-bytes", status_code=200, headers=None):
         self.content = content
         self.status_code = status_code
+        self.headers = headers or {}
 
 
 class _FakeMediaResponse:
-    def __init__(self, content=b"image-bytes", success=True, code=0, msg=""):
-        self.raw = _FakeRawResponse(content)
+    def __init__(self, content=b"image-bytes", success=True, code=0, msg="", headers=None):
+        self.raw = _FakeRawResponse(content, headers=headers)
         self.code = code
         self.msg = msg
         self._success = success
@@ -113,7 +114,7 @@ def _install_fake_lark_modules(monkeypatch):
     lark = ModuleType("lark_oapi")
     lark.BaseRequest = _FakeBaseRequest
     lark.HttpMethod = SimpleNamespace(GET="GET")
-    lark.AccessTokenType = SimpleNamespace(TENANT="tenant")
+    lark.AccessTokenType = SimpleNamespace(TENANT="tenant", USER="user")
     docx_v1 = ModuleType("lark_oapi.api.docx.v1")
     docx_v1.ListDocumentBlockRequest = _FakeListDocumentBlockRequest
     core_model = ModuleType("lark_oapi.core.model")
@@ -170,6 +171,126 @@ def test_resolve_image_refs_downloads_media_and_rewrites_markdown(monkeypatch):
     request = request_media.call_args.args[0]
     assert request.http_method == "GET"
     assert request.uri == "/open-apis/drive/v1/medias/img_token_123/download"
+
+
+def test_resolve_image_refs_uses_content_type_extension(monkeypatch):
+    _install_fake_lark_modules(monkeypatch)
+    request_media = MagicMock(
+        return_value=_FakeMediaResponse(
+            b"\xff\xd8\xff\xe0jpeg-bytes",
+            headers={"Content-Type": "image/jpeg"},
+        )
+    )
+    accessor = FeishuAccessor()
+    accessor._config = SimpleNamespace(download_images=True)
+    accessor._client = SimpleNamespace(request=request_media)
+
+    updated, images = accessor._resolve_image_refs(
+        "![j](feishu://image/img_token_jpeg)"
+    )
+
+    assert updated == "![j](images/img_token_jpeg.jpg)"
+    assert images == {"images/img_token_jpeg.jpg": b"\xff\xd8\xff\xe0jpeg-bytes"}
+
+
+def test_resolve_image_refs_falls_back_to_byte_magic_extension(monkeypatch):
+    _install_fake_lark_modules(monkeypatch)
+    # No usable Content-Type header; extension must come from WebP byte magic.
+    webp_bytes = b"RIFF\x00\x00\x00\x00WEBPfake"
+    request_media = MagicMock(return_value=_FakeMediaResponse(webp_bytes, headers={}))
+    accessor = FeishuAccessor()
+    accessor._config = SimpleNamespace(download_images=True)
+    accessor._client = SimpleNamespace(request=request_media)
+
+    updated, images = accessor._resolve_image_refs(
+        "![w](feishu://image/img_token_webp)"
+    )
+
+    assert updated == "![w](images/img_token_webp.webp)"
+    assert images == {"images/img_token_webp.webp": webp_bytes}
+
+
+def test_download_image_uses_tenant_token_without_user_token(monkeypatch):
+    _install_fake_lark_modules(monkeypatch)
+    request_media = MagicMock(return_value=_FakeMediaResponse(b"\x89PNG\r\n"))
+    accessor = FeishuAccessor()
+    accessor._config = SimpleNamespace(download_images=True)
+    accessor._client = SimpleNamespace(request=request_media)
+
+    accessor._download_image("img_token_123")
+
+    request = request_media.call_args.args[0]
+    assert request.token_types == {"tenant"}
+
+
+def test_download_image_advertises_user_token_when_provided(monkeypatch):
+    """With a user access token the media request must advertise USER, or
+    lark-oapi never injects it and the download silently fails."""
+    _install_fake_lark_modules(monkeypatch)
+    request_media = MagicMock(return_value=_FakeMediaResponse(b"\x89PNG\r\n"))
+    accessor = FeishuAccessor()
+    accessor._config = SimpleNamespace(download_images=True)
+    accessor._user_token_client = SimpleNamespace(request=request_media)
+
+    accessor._download_image("img_token_123", feishu_access_token="u-test")
+
+    args = request_media.call_args.args
+    request = args[0]
+    assert request.token_types == {"user"}
+    # The user access token option must also be forwarded on the call.
+    assert len(args) == 2
+    assert args[1].user_access_token == "u-test"
+
+
+def test_guess_image_ext_defaults_to_png_when_unknown():
+    accessor = FeishuAccessor()
+    assert accessor._guess_image_ext(b"not-an-image", None) == ".png"
+    assert accessor._guess_image_ext(b"\xff\xd8\xff", None) == ".jpg"
+    assert accessor._guess_image_ext(b"anything", "image/gif") == ".gif"
+
+
+def test_access_offloads_synchronous_download_to_thread(monkeypatch):
+    """access() must not run the synchronous _resolve_image_refs on the event loop."""
+    import threading
+
+    _install_fake_lark_modules(monkeypatch)
+    accessor = FeishuAccessor()
+    accessor._config = SimpleNamespace(download_images=True)
+
+    async def fake_fetch_document(*_args, **_kwargs):
+        from openviking.parse.accessors.feishu_accessor import FeishuDocument
+
+        return FeishuDocument(
+            doc_type="docx",
+            token="doc_token",
+            markdown_content="![s](feishu://image/img_token_123)",
+            title="Test Doc",
+            meta={},
+        )
+
+    monkeypatch.setattr(accessor, "_fetch_document", fake_fetch_document)
+
+    main_thread = threading.get_ident()
+    ran_on = {}
+
+    def fake_resolve(markdown, **_):
+        ran_on["thread"] = threading.get_ident()
+        return (
+            "![s](images/img_token_123.png)",
+            {"images/img_token_123.png": b"\x89PNG\r\n"},
+        )
+
+    monkeypatch.setattr(accessor, "_resolve_image_refs", fake_resolve)
+
+    resource = asyncio.run(accessor.access("https://example.feishu.cn/docx/doc_token"))
+    try:
+        assert "thread" in ran_on, "_resolve_image_refs was never called"
+        assert ran_on["thread"] != main_thread, (
+            "_resolve_image_refs ran on the event-loop thread; "
+            "it must be offloaded via asyncio.to_thread"
+        )
+    finally:
+        resource.cleanup()
 
 
 def test_access_writes_downloaded_images_next_to_markdown(monkeypatch):
